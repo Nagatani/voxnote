@@ -64,3 +64,4 @@ node src/index.js --file /path/to/recording.wav
 ```bash
 npm run watch
 ```
+
