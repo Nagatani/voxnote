@@ -1,0 +1,28 @@
+{
+  "name": "voxnote",
+  "version": "1.0.0",
+  "description": "Automated voice recorder transcription and summarization pipeline in Node.js",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "voxnote": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "watch": "node src/index.js --watch",
+    "dry-run": "node src/index.js --dry-run",
+    "test": "node --test test/voxnote.test.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "voice-recorder",
+    "transcription",
+    "gemini",
+    "obsidian",
+    "macos",
+    "voxnote"
+  ],
+  "license": "MIT"
+}
