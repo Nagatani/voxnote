@@ -2,7 +2,7 @@
 
 **Node.js (ES Modules / 標準ライブラリ)** と **Google Gemini API**・**ffmpeg** を用いて実装した、ボイスレコーダー自動文字起こし＆構造化要約システムです。
 
-ボイスレコーダーや指定フォルダ内の音声データを取り込み、長時間音声の自動分割（チャンク化）・Gemini APIによる文字起こし＆要約・Obsidian等と連携しやすいMarkdownノートの生成までを自動で行います。
+ボイスレコーダーや指定フォルダ内の音声データを取り込み、長時間音声の自動分割（チャンク化）・Gemini APIによる文字起こし＆要約・Markdownファイルの生成までを自動で行います。
 
 ---
 
@@ -36,7 +36,7 @@
    ```bash
    cp .env.example .env
    ```
-   `.env` を開き、`GEMINI_API_KEY` やボイスレコーダーのマウントパス（`RECORDER_SOURCE_DIR`）、Obsidian等の出力先（`MARKDOWN_OUTPUT_DIR`）を設定します。
+   `.env` を開き、`GEMINI_API_KEY` やボイスレコーダーのマウントパス（`RECORDER_SOURCE_DIR`）、Markdownの出力先（`MARKDOWN_OUTPUT_DIR`）を設定します。
 
 2. **ドライラン（APIを消費しない動作確認テスト）**
    ```bash

@@ -35,7 +35,7 @@ export function formatDateParts(date) {
 }
 
 /**
- * Write the final Obsidian-friendly Markdown file containing metadata, summary, and full transcript.
+ * Write the final Markdown file containing metadata, summary, and full transcript.
  */
 export async function writeMarkdownNote({
   outputDir,
