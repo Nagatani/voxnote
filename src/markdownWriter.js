@@ -49,7 +49,7 @@ export async function writeMarkdownNote({
 }) {
   await fs.mkdir(outputDir, { recursive: true });
 
-  const { filePrefix, isoDate, readableDateTime } = formatDateParts(recordedAt);
+  const { filePrefix, readableDateTime } = formatDateParts(recordedAt);
   const safeTitle = sanitizeTitleForFilename(title);
   const fileName = `${filePrefix}_${safeTitle}.md`;
   const outputPath = path.join(outputDir, fileName);
@@ -57,23 +57,12 @@ export async function writeMarkdownNote({
   const audioFileName = path.basename(audioPath);
   const formattedDuration = formatSeconds(durationSeconds);
 
-  const markdownContent = `---
-title: "${title.replace(/"/g, '\\"')}"
-date: ${isoDate}
-recorded_at: "${readableDateTime}"
-duration: "${formattedDuration}"
-source_audio: "${audioFileName}"
-model: "${modelName}"
-tags:
-  - voice-memo
-  - voxnote
----
-
-# ${title}
+  const markdownContent = `# ${title}
 
 - **録音日時**: ${readableDateTime}
 - **再生時間**: ${formattedDuration}
 - **元ファイル**: \`${audioFileName}\`
+- **使用モデル**: \`${modelName}\`
 
 ---
 
@@ -81,7 +70,7 @@ ${summaryMarkdown}
 
 ---
 
-## 全文文字起こし (Transcript)
+## 全文文字起こし
 
 ${fullTranscript}
 `;

@@ -269,17 +269,14 @@ export async function summarizeTranscript(
     return {
       title: 'ドライラン音声テストメモ',
       summaryMarkdown: [
-        '## 概要 (Executive Summary)',
+        '## 要約',
         '- ドライランモードで生成されたテスト要約です。',
         '',
-        '## 重要なポイント・議論内容',
+        '## 詳細・主なトピック',
         '- 音声チャンク分割とキャッシュ機構が正常に動作しています。',
         '',
-        '## ネクストアクション / TODO',
+        '## アクションアイテム / TODO',
         '- [ ] `.env` に `GEMINI_API_KEY` を設定して本番実行する',
-        '',
-        '## キーワード・タグ候補',
-        '- `#voxnote` `#ボイスメモ` `#自動文字起こし`',
       ].join('\n'),
     };
   }
@@ -303,7 +300,12 @@ export async function summarizeTranscript(
  * Extract `TITLE: ...` line and remaining Markdown body from Gemini response.
  */
 export function parseTitleAndSummary(rawOutput) {
-  const lines = rawOutput.trim().split(/\r?\n/);
+  const cleaned = rawOutput
+    .trim()
+    .replace(/^```(?:markdown|md|text)?\r?\n/i, '')
+    .replace(/\r?\n```$/i, '')
+    .trim();
+  const lines = cleaned.split(/\r?\n/);
   let title = 'ボイスメモ記録';
   let bodyStartIndex = 0;
 
@@ -319,6 +321,6 @@ export function parseTitleAndSummary(rawOutput) {
   const summaryMarkdown = lines.slice(bodyStartIndex).join('\n').trim();
   return {
     title,
-    summaryMarkdown: summaryMarkdown || rawOutput.trim(),
+    summaryMarkdown: summaryMarkdown || cleaned,
   };
 }

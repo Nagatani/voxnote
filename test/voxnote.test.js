@@ -80,9 +80,9 @@ test('voxnote Node.js Pipeline End-to-End Test (with ffmpeg audio chunking & Mar
 
   // Verify Markdown output content
   const mdContent = await fs.readFile(results[0].markdownPath, 'utf8');
-  assert.match(mdContent, /title: "ドライラン音声テストメモ"/);
-  assert.match(mdContent, /## 概要 \(Executive Summary\)/);
-  assert.match(mdContent, /## 全文文字起こし \(Transcript\)/);
+  assert.match(mdContent, /# ドライラン音声テストメモ/);
+  assert.match(mdContent, /## 要約/);
+  assert.match(mdContent, /## 全文文字起こし/);
   assert.match(mdContent, /### Part 1/);
   assert.match(mdContent, /### Part 2/);
   assert.match(mdContent, /### Part 3/);
