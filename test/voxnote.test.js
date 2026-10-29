@@ -97,3 +97,10 @@ test('parseTitleAndSummary extracts TITLE line and Markdown body cleanly', () =>
   assert.equal(parsed.title, 'プロジェクト定例会議メモ');
   assert.equal(parsed.summaryMarkdown, '## 概要\n- テスト内容');
 });
+
+test('loadConfig unescapes shell-escaped spaces in directory paths', () => {
+  const config = loadConfig(null, {
+    RECORDER_SOURCE_DIR: '/Volumes/NO\\ NAME/RECORD',
+  });
+  assert.equal(config.recorderSourceDir, '/Volumes/NO NAME/RECORD');
+});

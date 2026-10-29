@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -59,8 +60,15 @@ export function loadConfig(customConfigPath = null, overrides = {}) {
     return fallback;
   };
 
-  const resolveDir = (dirPath) =>
-    path.isAbsolute(dirPath) ? dirPath : path.resolve(PROJECT_ROOT, dirPath);
+  const resolveDir = (dirPath) => {
+    let normalized = String(dirPath).trim().replace(/\\ /g, ' ');
+    if (normalized.startsWith('~/')) {
+      normalized = path.join(os.homedir(), normalized.slice(2));
+    }
+    return path.isAbsolute(normalized)
+      ? normalized
+      : path.resolve(PROJECT_ROOT, normalized);
+  };
 
   const apiKey = get('GEMINI_API_KEY', get('GOOGLE_API_KEY', ''));
 
@@ -85,6 +93,16 @@ export function loadConfig(customConfigPath = null, overrides = {}) {
     chunkAudioFormat: get('CHUNK_AUDIO_FORMAT', 'm4a'),
     enableMacosNotification:
       String(get('ENABLE_MACOS_NOTIFICATION', 'true')).toLowerCase() === 'true',
-    supportedExtensions: ['.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg', '.mp4'],
+    supportedExtensions: [
+      '.wav',
+      '.mp3',
+      '.m4a',
+      '.aac',
+      '.flac',
+      '.ogg',
+      '.mp4',
+      '.wma',
+      '.webm',
+    ],
   };
 }
