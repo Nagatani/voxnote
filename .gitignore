@@ -1,0 +1,7 @@
+.env
+
+audio_archive/
+output_notes/
+
+.tmp_chunks/
+processed_files.json
