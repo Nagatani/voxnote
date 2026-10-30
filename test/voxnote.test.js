@@ -15,6 +15,7 @@ import { loadConfig } from '../src/config.js';
 import {
   hasMeaningfulSpeech,
   parseTitleAndSummary,
+  transcribeAudioChunk,
 } from '../src/geminiService.js';
 import {
   collapseConsecutivePlaceholders,
@@ -201,4 +202,74 @@ test('isSilentAudio distinguishes silent audio from tone audio', async () => {
   assert.equal(await isSilentAudio(toneWav), false);
 
   await fs.rm(tmpDir, { recursive: true, force: true });
+});
+
+test('transcribeAudioChunk sends AudioContent (type: "audio") to /v1beta/interactions for gemini-3.5-transcribe', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'voxnote-stt-'));
+  const toneWav = path.join(tmpDir, 'tone.wav');
+  await execFileAsync('ffmpeg', [
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    'sine=frequency=440:duration=2',
+    '-ac',
+    '1',
+    '-ar',
+    '16000',
+    toneWav,
+  ]);
+
+  let capturedUrl = null;
+  let capturedBody = null;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    capturedUrl = String(url);
+    capturedBody = JSON.parse(opts.body);
+    return new Response(
+      JSON.stringify({
+        status: 'completed',
+        steps: [
+          {
+            type: 'model_output',
+            content: [{ type: 'text', text: 'テスト文字起こし成功' }],
+          },
+        ],
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  };
+
+  try {
+    const result = await transcribeAudioChunk(
+      {
+        audioPath: toneWav,
+        index: 0,
+        startSeconds: 0,
+        endSeconds: 2,
+      },
+      1,
+      'テスト用プロンプト',
+      {
+        geminiApiKey: 'test-key',
+        geminiTranscribeModel: 'gemini-3.5-transcribe',
+        geminiModel: 'gemini-3.8-flash',
+        customVocabulary: ['PySide6', 'FastAPI'],
+      }
+    );
+
+    assert.equal(result, 'テスト文字起こし成功');
+    assert.ok(capturedUrl.endsWith('/v1beta/interactions'));
+    assert.equal(capturedBody.model, 'gemini-3.5-transcribe');
+    assert.equal(capturedBody.input[0].type, 'audio');
+    assert.equal(capturedBody.input[0].mime_type, 'audio/wav');
+    assert.ok(capturedBody.input[0].data.length > 0);
+    assert.deepEqual(
+      capturedBody.generation_config.transcription_config.custom_vocabulary,
+      ['PySide6', 'FastAPI']
+    );
+  } finally {
+    globalThis.fetch = origFetch;
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
 });

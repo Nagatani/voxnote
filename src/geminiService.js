@@ -281,15 +281,31 @@ async function deleteGeminiRemoteFile(apiKey, fileName) {
  */
 async function transcribeWithDedicatedModel(audioPath, config) {
   const mimeType = getAudioMimeType(audioPath);
-  const modelName = config.geminiTranscribeModel.startsWith('models/')
-    ? config.geminiTranscribeModel
-    : `models/${config.geminiTranscribeModel}`;
+  const modelName = config.geminiTranscribeModel.replace(/^models\//, '');
+  const stat = await fs.stat(audioPath);
 
-  const uploadedFile = await uploadToGeminiFileApi(
-    config.geminiApiKey,
-    audioPath,
-    mimeType
-  );
+  let uploadedFile = null;
+  let audioContentInput;
+
+  if (stat.size <= 15 * 1024 * 1024) {
+    const buffer = await fs.readFile(audioPath);
+    audioContentInput = {
+      type: 'audio',
+      data: buffer.toString('base64'),
+      mime_type: mimeType,
+    };
+  } else {
+    uploadedFile = await uploadToGeminiFileApi(
+      config.geminiApiKey,
+      audioPath,
+      mimeType
+    );
+    audioContentInput = {
+      type: 'audio',
+      uri: uploadedFile.uri,
+      mime_type: uploadedFile.mimeType || mimeType,
+    };
+  }
 
   try {
     const transcriptionConfig = {
@@ -319,13 +335,7 @@ async function transcribeWithDedicatedModel(audioPath, config) {
           body: JSON.stringify({
             model: modelName,
             store: false,
-            input: [
-              {
-                type: 'file',
-                file_uri: uploadedFile.uri,
-                mime_type: uploadedFile.mimeType || mimeType,
-              },
-            ],
+            input: [audioContentInput],
             generation_config: {
               transcription_config: transcriptionConfig,
             },
@@ -351,6 +361,13 @@ async function transcribeWithDedicatedModel(audioPath, config) {
         }
       }
     }
+    if (texts.length === 0) {
+      for (const item of data.outputs || []) {
+        if (item.type === 'text' && item.text) {
+          texts.push(item.text.trim());
+        }
+      }
+    }
 
     const combined = texts.filter(Boolean).join('\n\n').trim();
     if (!combined) {
@@ -361,7 +378,9 @@ async function transcribeWithDedicatedModel(audioPath, config) {
     }
     return combined;
   } finally {
-    await deleteGeminiRemoteFile(config.geminiApiKey, uploadedFile.name);
+    if (uploadedFile) {
+      await deleteGeminiRemoteFile(config.geminiApiKey, uploadedFile.name);
+    }
   }
 }
 
