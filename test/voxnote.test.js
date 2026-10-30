@@ -12,6 +12,10 @@ import {
 } from '../src/audioChunker.js';
 import { loadConfig } from '../src/config.js';
 import { parseTitleAndSummary } from '../src/geminiService.js';
+import {
+  collapseConsecutivePlaceholders,
+  extractRecordedDateFromFilename,
+} from '../src/markdownWriter.js';
 import { runPipelineBatch } from '../src/pipeline.js';
 
 const execFileAsync = promisify(execFile);
@@ -26,8 +30,8 @@ test('voxnote Node.js Pipeline End-to-End Test (with ffmpeg audio chunking & Mar
 
   await fs.mkdir(recorderDir, { recursive: true });
 
-  // Synthesize a 12-second sine wave WAV file using ffmpeg
-  const sampleWavPath = path.join(recorderDir, 'REC001.WAV');
+  // Synthesize a 12-second sine wave WAV file with a timestamp filename
+  const sampleWavPath = path.join(recorderDir, '2026-10-29-12-09-00.WAV');
   await execFileAsync('ffmpeg', [
     '-y',
     '-f',
@@ -74,13 +78,20 @@ test('voxnote Node.js Pipeline End-to-End Test (with ffmpeg audio chunking & Mar
   assert.equal(results[0].skipped, false);
   assert.ok(fsSync.existsSync(results[0].markdownPath));
 
+  // Verify filename uses the timestamp from 2026-10-29-12-09-00.WAV
+  assert.match(path.basename(results[0].markdownPath), /^2026-10-29_120900_/);
+
   // Verify source file on recorder was deleted after safe copy to archive
   assert.equal(fsSync.existsSync(sampleWavPath), false);
-  assert.equal(fsSync.existsSync(path.join(archiveDir, 'REC001.WAV')), true);
+  assert.equal(
+    fsSync.existsSync(path.join(archiveDir, '2026-10-29-12-09-00.WAV')),
+    true
+  );
 
   // Verify Markdown output content
   const mdContent = await fs.readFile(results[0].markdownPath, 'utf8');
   assert.match(mdContent, /# ドライラン音声テストメモ/);
+  assert.match(mdContent, /- \*\*録音日時\*\*: 2026-10-29 12:09:00/);
   assert.match(mdContent, /## 要約/);
   assert.match(mdContent, /## 全文文字起こし/);
   assert.match(mdContent, /### Part 1/);
@@ -103,4 +114,39 @@ test('loadConfig unescapes shell-escaped spaces in directory paths', () => {
     RECORDER_SOURCE_DIR: '/Volumes/NO\\ NAME/RECORD',
   });
   assert.equal(config.recorderSourceDir, '/Volumes/NO NAME/RECORD');
+});
+
+test('extractRecordedDateFromFilename parses YYYY-MM-DD-HH-mm-ss filenames accurately', () => {
+  const fallback = new Date(2020, 0, 1);
+  const parsed = extractRecordedDateFromFilename(
+    '/path/to/2026-10-29-12-09-00.WAV',
+    fallback
+  );
+  assert.equal(parsed.getFullYear(), 2026);
+  assert.equal(parsed.getMonth(), 9); // October (0-indexed)
+  assert.equal(parsed.getDate(), 29);
+  assert.equal(parsed.getHours(), 12);
+  assert.equal(parsed.getMinutes(), 9);
+  assert.equal(parsed.getSeconds(), 0);
+});
+
+test('collapseConsecutivePlaceholders merges contiguous skip ranges and duplicate [発話なし]', () => {
+  const raw = [
+    '[※ 00:00:00 〜 00:01:30 の区間は背景音またはAPI制限によりスキップされました]',
+    '[※ 00:01:30 〜 00:03:00 の区間は背景音またはAPI制限によりスキップされました]',
+    '[※ 00:03:00 〜 00:04:30 の区間は背景音またはAPI制限によりスキップされました]',
+    'こんにちは。テスト発話です。',
+    '[発話なし]',
+    '[発話なし]',
+  ].join('\n\n');
+
+  const cleaned = collapseConsecutivePlaceholders(raw);
+  assert.equal(
+    cleaned,
+    [
+      '[※ 00:00:00 〜 00:04:30 の区間は背景音またはAPI制限によりスキップされました]',
+      'こんにちは。テスト発話です。',
+      '[発話なし]',
+    ].join('\n\n')
+  );
 });

@@ -40,19 +40,21 @@ export function formatSeconds(totalSeconds) {
 
 /**
  * Split or normalize an audio file into manageable chunks for Gemini API transcription.
- * Uses `.tmp_chunks/<fileHash>/` for caching both audio chunks and intermediate transcripts.
+ * Includes chunk duration & overlap settings in the cache directory name so changing
+ * `CHUNK_DURATION_SECONDS` never reuses mismatched audio chunks.
  */
 export async function prepareAudioChunks(filePath, fileHash, config) {
   const {
     tmpChunksDir,
-    chunkDurationSeconds = 1200,
+    chunkDurationSeconds = 600,
     chunkOverlapSeconds = 5,
     chunkAudioFormat = 'm4a',
   } = config;
 
   const duration = await getAudioDurationSeconds(filePath);
   const stat = await fs.stat(filePath);
-  const fileWorkDir = path.join(tmpChunksDir, fileHash.slice(0, 16));
+  const cacheKey = `${fileHash.slice(0, 16)}_${chunkDurationSeconds}s_${chunkOverlapSeconds}s`;
+  const fileWorkDir = path.join(tmpChunksDir, cacheKey);
   await fs.mkdir(fileWorkDir, { recursive: true });
 
   // Determine codec flags for compact speech representation (16kHz mono)
@@ -68,7 +70,6 @@ export async function prepareAudioChunks(filePath, fileHash, config) {
   };
 
   // Case 1: Short audio that doesn't need multi-part chunking
-  // However, if it's a large uncompressed WAV (> 15 MB), compress to mono m4a for fast upload
   const MAX_INLINE_BYTES = 15 * 1024 * 1024;
   if (duration <= chunkDurationSeconds) {
     if (stat.size <= MAX_INLINE_BYTES) {
@@ -120,12 +121,20 @@ export async function prepareAudioChunks(filePath, fileHash, config) {
   }
 
   // Case 2: Long audio (> chunkDurationSeconds) -> split with overlap
+  // Absorb tiny trailing remainder (<= minTrailingSeconds) into the final chunk
   const chunks = [];
   const step = Math.max(1, chunkDurationSeconds - chunkOverlapSeconds);
+  const minTrailingSeconds = Math.min(
+    60,
+    Math.floor(chunkDurationSeconds * 0.15)
+  );
   let index = 0;
 
   for (let start = 0; start < duration; start += step) {
-    const end = Math.min(duration, start + chunkDurationSeconds);
+    let end = Math.min(duration, start + chunkDurationSeconds);
+    if (duration - end > 0 && duration - end <= minTrailingSeconds) {
+      end = duration;
+    }
     const chunkLen = end - start;
     const paddedIdx = String(index).padStart(3, '0');
     const chunkAudioPath = path.join(

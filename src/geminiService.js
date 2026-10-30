@@ -13,7 +13,7 @@ const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com';
 const MIME_MAP = {
   '.wav': 'audio/wav',
   '.mp3': 'audio/mp3',
-  '.m4a': 'audio/mp4',
+  '.m4a': 'audio/m4a',
   '.mp4': 'audio/mp4',
   '.aac': 'audio/aac',
   '.flac': 'audio/flac',
@@ -44,7 +44,7 @@ export class GeminiBlockedError extends Error {
 
 export function getAudioMimeType(filePath) {
   const ext = path.extname(filePath).toLowerCase();
-  return MIME_MAP[ext] || 'audio/mp4';
+  return MIME_MAP[ext] || 'audio/m4a';
 }
 
 async function sleep(ms) {
@@ -52,9 +52,8 @@ async function sleep(ms) {
 }
 
 /**
- * Call Gemini REST API with automatic exponential backoff retry for 429 / 5xx / network errors.
- * Throws `GeminiBlockedError` immediately (without pointless retries on cached blocks)
- * when `promptFeedback.blockReason` or `finishReason` blocks the response.
+ * Call Gemini REST API (`generateContent`) with automatic exponential backoff retry for 429 / 5xx.
+ * Treats empty text with `finishReason: "STOP"` as `[発話なし]` without retrying.
  */
 async function callGenerateContent(apiKey, model, contents, maxRetries = 3) {
   const url = `${GEMINI_API_BASE}/v1beta/models/${encodeURIComponent(
@@ -92,20 +91,24 @@ async function callGenerateContent(apiKey, model, contents, maxRetries = 3) {
         const httpErr = new Error(
           `Gemini API error (${response.status}): ${errBody.slice(0, 500)}`
         );
-        httpErr.nonRetryable = response.status >= 400 && response.status < 500 && response.status !== 429;
+        httpErr.nonRetryable =
+          response.status >= 400 &&
+          response.status < 500 &&
+          response.status !== 429;
         throw httpErr;
       }
 
       const data = await response.json();
+      const finishReason = data.candidates?.[0]?.finishReason;
 
       // Check if blocked by promptFeedback or candidate finishReason
       const blockReason =
         data.promptFeedback?.blockReason ||
-        (data.candidates?.[0]?.finishReason &&
+        (finishReason &&
         ['SAFETY', 'RECITATION', 'OTHER', 'BLOCKLIST', 'PROHIBITED_CONTENT'].includes(
-          data.candidates[0].finishReason
+          finishReason
         )
-          ? data.candidates[0].finishReason
+          ? finishReason
           : null);
 
       const text = (data.candidates?.[0]?.content?.parts || [])
@@ -118,6 +121,10 @@ async function callGenerateContent(apiKey, model, contents, maxRetries = 3) {
         if (blockReason) {
           throw new GeminiBlockedError(blockReason, data);
         }
+        // When finishReason is STOP with empty parts, the audio segment had no recognizable speech
+        if (finishReason === 'STOP') {
+          return '[発話なし]';
+        }
         throw new Error(
           `Gemini API returned empty text. Raw response: ${JSON.stringify(data).slice(0, 300)}`
         );
@@ -125,7 +132,6 @@ async function callGenerateContent(apiKey, model, contents, maxRetries = 3) {
       return text;
     } catch (err) {
       lastError = err;
-      // Do not retry identical payload if blocked by safety/recitation/other or 4xx client error
       if (err instanceof GeminiBlockedError || err.nonRetryable) {
         throw err;
       }
@@ -142,7 +148,7 @@ async function callGenerateContent(apiKey, model, contents, maxRetries = 3) {
 }
 
 /**
- * Upload an audio file via the Gemini File API (resumable upload) for large files,
+ * Upload an audio file via the Gemini File API (resumable upload),
  * wait until state is ACTIVE, and return the file metadata (`uri`, `name`, `mimeType`).
  */
 async function uploadToGeminiFileApi(apiKey, filePath, mimeType) {
@@ -208,7 +214,7 @@ async function uploadToGeminiFileApi(apiKey, filePath, mimeType) {
         throw new Error(`Gemini File processing failed for ${file.name}`);
       }
     }
-    await sleep(2000);
+    await sleep(1500);
   }
 
   return file;
@@ -226,10 +232,97 @@ async function deleteGeminiRemoteFile(apiKey, fileName) {
 }
 
 /**
- * Send a single audio file + prompt to Gemini (using inlineData for <=15MB or File API for >15MB).
+ * Transcribe audio using the dedicated Speech-to-Text model (`gemini-3.5-transcribe`)
+ * via the Gemini Interactions API (`/v1beta/interactions`).
  */
-async function sendAudioToGemini(audioPath, promptText, config) {
+async function transcribeWithDedicatedModel(audioPath, config) {
   const mimeType = getAudioMimeType(audioPath);
+  const modelName = config.geminiTranscribeModel.startsWith('models/')
+    ? config.geminiTranscribeModel
+    : `models/${config.geminiTranscribeModel}`;
+
+  const uploadedFile = await uploadToGeminiFileApi(
+    config.geminiApiKey,
+    audioPath,
+    mimeType
+  );
+
+  try {
+    const transcriptionConfig = {
+      mode: 'smart',
+      language_codes: ['ja-JP'],
+    };
+    if (
+      Array.isArray(config.customVocabulary) &&
+      config.customVocabulary.length > 0
+    ) {
+      transcriptionConfig.custom_vocabulary = config.customVocabulary.slice(
+        0,
+        1000
+      );
+    }
+
+    const res = await fetch(`${GEMINI_API_BASE}/v1beta/interactions`, {
+      method: 'POST',
+      headers: {
+        'x-goog-api-key': config.geminiApiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: modelName,
+        store: false,
+        input: [
+          {
+            type: 'file',
+            file_uri: uploadedFile.uri,
+            mime_type: uploadedFile.mimeType || mimeType,
+          },
+        ],
+        generation_config: {
+          transcription_config: transcriptionConfig,
+        },
+      }),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      throw new Error(
+        `gemini-3.5-transcribe HTTP ${res.status}: ${errBody.slice(0, 400)}`
+      );
+    }
+
+    const data = await res.json();
+    const texts = [];
+    for (const step of data.steps || []) {
+      if (step.type === 'model_output') {
+        for (const item of step.content || []) {
+          if (item.type === 'text' && item.text) {
+            texts.push(item.text.trim());
+          }
+        }
+      }
+    }
+
+    const combined = texts.filter(Boolean).join('\n\n').trim();
+    if (!combined) {
+      if (data.status === 'completed') {
+        return '[発話なし]';
+      }
+      throw new GeminiBlockedError(data.status || 'EMPTY_TRANSCRIPT', data);
+    }
+    return combined;
+  } finally {
+    await deleteGeminiRemoteFile(config.geminiApiKey, uploadedFile.name);
+  }
+}
+
+/**
+ * Send a single audio file + prompt to Gemini `generateContent` (using inlineData for <=15MB or File API for >15MB).
+ */
+async function sendAudioToGenerateContent(audioPath, promptText, config) {
+  // For generateContent, audio/mp4 is widely accepted for .m4a
+  const ext = path.extname(audioPath).toLowerCase();
+  const mimeType = ext === '.m4a' ? 'audio/mp4' : getAudioMimeType(audioPath);
   const stat = await fs.stat(audioPath);
 
   if (stat.size <= 15 * 1024 * 1024) {
@@ -278,26 +371,25 @@ async function sendAudioToGemini(audioPath, promptText, config) {
 }
 
 /**
- * Fallback when a long audio chunk is blocked by `blockReason: OTHER` or `RECITATION`:
- * Splits the chunk into smaller 3-minute (180s) sub-chunks so that a brief noisy/BGM segment
- * does not cause the entire 20-minute chunk to fail.
+ * Fallback when an audio chunk is blocked by `blockReason: OTHER` or `RECITATION`:
+ * Immediately splits the chunk into 90-second sub-chunks so that a brief BGM/noise segment
+ * only skips at most 90 seconds and does not waste time retrying the full 10-minute chunk.
  */
 async function transcribeBlockedChunkBySplitting(chunk, fallbackPrompt, config) {
-  const SUB_CHUNK_SECONDS = 180; // 3 minutes per sub-chunk
+  const SUB_CHUNK_SECONDS = 90; // 1.5 minutes per sub-chunk for minimal loss
   const duration = await getAudioDurationSeconds(chunk.audioPath);
   const workDir = path.dirname(chunk.audioPath);
   const baseName = path.basename(chunk.audioPath, path.extname(chunk.audioPath));
 
   if (duration <= SUB_CHUNK_SECONDS + 15) {
-    // Already short and still blocked -> skip only this segment instead of aborting the whole file
     logWarn(
       `Segment [${formatSeconds(chunk.startSeconds)} - ${formatSeconds(
         chunk.endSeconds
-      )}] was blocked by Gemini API even after fallback; skipping segment.`
+      )}] was blocked by Gemini API; skipping segment.`
     );
     return `[※ ${formatSeconds(chunk.startSeconds)} 〜 ${formatSeconds(
       chunk.endSeconds
-    )} の区間は背景音またはAPIのコンテンツ制限（blockReason: OTHER）により文字起こしをスキップしました]`;
+    )} の区間は背景音またはAPI制限によりスキップされました]`;
   }
 
   logInfo(
@@ -313,7 +405,7 @@ async function transcribeBlockedChunkBySplitting(chunk, fallbackPrompt, config) 
     const subLen = Math.min(SUB_CHUNK_SECONDS, duration - offset);
     const absStart = chunk.startSeconds + offset;
     const absEnd = absStart + subLen;
-    const subTag = `${baseName}_sub${String(subIndex).padStart(2, '0')}`;
+    const subTag = `${baseName}_sub90_${String(subIndex).padStart(2, '0')}`;
     const subAudioPath = path.join(workDir, `${subTag}.m4a`);
     const subCachePath = path.join(workDir, `${subTag}.txt`);
 
@@ -352,7 +444,7 @@ async function transcribeBlockedChunkBySplitting(chunk, fallbackPrompt, config) 
     );
 
     try {
-      const subText = await sendAudioToGemini(
+      const subText = await sendAudioToGenerateContent(
         subAudioPath,
         `${fallbackPrompt}\n（対象区間: ${formatSeconds(absStart)}〜${formatSeconds(absEnd)}）`,
         config
@@ -364,7 +456,7 @@ async function transcribeBlockedChunkBySplitting(chunk, fallbackPrompt, config) 
         logWarn(
           `  Sub-chunk #${subIndex + 1} [${formatSeconds(absStart)} - ${formatSeconds(
             absEnd
-          )}] blocked (${subErr.reason}); skipping this 3-min segment.`
+          )}] blocked (${subErr.reason}); skipping this 90s segment.`
         );
         const placeholder = `[※ ${formatSeconds(absStart)} 〜 ${formatSeconds(
           absEnd
@@ -383,8 +475,10 @@ async function transcribeBlockedChunkBySplitting(chunk, fallbackPrompt, config) 
 }
 
 /**
- * Transcribe a single audio chunk using Gemini, with automatic fallback and sub-chunk
- * recovery if Gemini returns `blockReason: OTHER` / `RECITATION`.
+ * Transcribe a single audio chunk:
+ * 1. If `config.geminiTranscribeModel` is a dedicated `*transcribe*` model (e.g. `gemini-3.5-transcribe`),
+ *    uses the dedicated Speech-to-Text Interactions API first.
+ * 2. Falls back to `config.geminiModel` (`generateContent`) and 90-second sub-chunk splitting if needed.
  */
 export async function transcribeAudioChunk(
   chunk,
@@ -409,6 +503,21 @@ export async function transcribeAudioChunk(
     );
   }
 
+  const transcribeModel = config.geminiTranscribeModel || '';
+
+  // Try dedicated speech-to-text model (`gemini-3.5-transcribe`) if configured
+  if (transcribeModel.includes('transcribe')) {
+    try {
+      return await transcribeWithDedicatedModel(chunk.audioPath, config);
+    } catch (transcribeErr) {
+      logWarn(
+        `Dedicated model (${transcribeModel}) failed on chunk #${
+          chunk.index + 1
+        } (${transcribeErr.message}). Falling back to ${config.geminiModel}...`
+      );
+    }
+  }
+
   const chunkHeader =
     totalChunks > 1
       ? `\n\n※この音声は全体のうちパート ${chunk.index + 1}/${totalChunks}（開始位置: ${formatSeconds(
@@ -416,47 +525,35 @@ export async function transcribeAudioChunk(
         )}〜${formatSeconds(chunk.endSeconds)}）です。`
       : '';
 
-  const fullPrompt = `${promptTemplate.trim()}${chunkHeader}`;
+  const vocabHint =
+    Array.isArray(config.customVocabulary) && config.customVocabulary.length > 0
+      ? `\n\n【用語ヒント（音声に含まれる可能性がある固有名詞・専門用語）】\n${config.customVocabulary.join(', ')}`
+      : '';
+
+  const fullPrompt = `${promptTemplate.trim()}${vocabHint}${chunkHeader}`;
 
   try {
-    return await sendAudioToGemini(chunk.audioPath, fullPrompt, config);
+    return await sendAudioToGenerateContent(chunk.audioPath, fullPrompt, config);
   } catch (err) {
     if (!(err instanceof GeminiBlockedError)) {
       throw err;
     }
 
-    logWarn(
-      `Chunk #${chunk.index + 1} [${formatSeconds(
-        chunk.startSeconds
-      )} - ${formatSeconds(
-        chunk.endSeconds
-      )}] was blocked (${err.reason}). Retrying with simplified prompt...`
-    );
-
     const fallbackPrompt = [
       'この音声に含まれる人の会話・発言内容のみを日本語で文字起こししてください。',
       '背景の音楽・BGM・環境音・雑音はすべて無視し、聞き取れる会話のみを自然な文章で出力してください。',
-      '前置きや挨拶は出力せず、本文のみを出力してください。',
-    ].join('\n');
+      '発話がない場合は [発話なし] とだけ出力してください。前置きや挨拶は不要です。',
+      vocabHint,
+    ]
+      .filter(Boolean)
+      .join('\n');
 
-    try {
-      return await sendAudioToGemini(
-        chunk.audioPath,
-        `${fallbackPrompt}\n（区間: ${formatSeconds(chunk.startSeconds)}〜${formatSeconds(
-          chunk.endSeconds
-        )}）`,
-        config
-      );
-    } catch (fallbackErr) {
-      if (!(fallbackErr instanceof GeminiBlockedError)) {
-        throw fallbackErr;
-      }
-      return await transcribeBlockedChunkBySplitting(
-        chunk,
-        fallbackPrompt,
-        config
-      );
-    }
+    // Immediately split into 90s sub-chunks without wasting 40s retrying the full 10-min chunk
+    return await transcribeBlockedChunkBySplitting(
+      chunk,
+      fallbackPrompt,
+      config
+    );
   }
 }
 

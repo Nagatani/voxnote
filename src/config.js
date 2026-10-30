@@ -71,10 +71,22 @@ export function loadConfig(customConfigPath = null, overrides = {}) {
   };
 
   const apiKey = get('GEMINI_API_KEY', get('GOOGLE_API_KEY', ''));
+  const rawVocab = get('CUSTOM_VOCABULARY', '');
+  const customVocabulary = rawVocab
+    ? String(rawVocab)
+        .split(',')
+        .map((w) => w.trim())
+        .filter(Boolean)
+    : [];
 
   return {
     geminiApiKey: apiKey,
     geminiModel: get('GEMINI_MODEL', 'gemini-3.8-flash'),
+    geminiTranscribeModel: get(
+      'GEMINI_TRANSCRIBE_MODEL',
+      'gemini-3.5-transcribe'
+    ),
+    customVocabulary,
     recorderSourceDir: resolveDir(get('RECORDER_SOURCE_DIR', './input_recorder')),
     audioArchiveDir: resolveDir(get('AUDIO_ARCHIVE_DIR', './audio_archive')),
     markdownOutputDir: resolveDir(get('MARKDOWN_OUTPUT_DIR', './output_notes')),
@@ -88,7 +100,7 @@ export function loadConfig(customConfigPath = null, overrides = {}) {
     ),
     deleteSourceFiles:
       String(get('DELETE_SOURCE_FILES', 'false')).toLowerCase() === 'true',
-    chunkDurationSeconds: Number(get('CHUNK_DURATION_SECONDS', 1200)),
+    chunkDurationSeconds: Number(get('CHUNK_DURATION_SECONDS', 600)),
     chunkOverlapSeconds: Number(get('CHUNK_OVERLAP_SECONDS', 5)),
     chunkAudioFormat: get('CHUNK_AUDIO_FORMAT', 'm4a'),
     enableMacosNotification:

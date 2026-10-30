@@ -5,7 +5,10 @@ import { prepareAudioChunks, formatSeconds } from './audioChunker.js';
 import { findAudioFiles, ingestFromRecorder } from './fileMover.js';
 import { summarizeTranscript, transcribeAudioChunk } from './geminiService.js';
 import { computeFileHash, HistoryStore } from './historyStore.js';
-import { writeMarkdownNote } from './markdownWriter.js';
+import {
+  collapseConsecutivePlaceholders,
+  writeMarkdownNote,
+} from './markdownWriter.js';
 import {
   logError,
   logInfo,
@@ -89,11 +92,12 @@ export async function processAudioFile(
   }
 
   const fullTranscript = chunkTranscripts
-    .map((text, idx) =>
-      chunks.length > 1
-        ? `### Part ${idx + 1} (${formatSeconds(chunks[idx].startSeconds)} - ${formatSeconds(chunks[idx].endSeconds)})\n\n${text}`
-        : text
-    )
+    .map((text, idx) => {
+      const cleaned = collapseConsecutivePlaceholders(text);
+      return chunks.length > 1
+        ? `### Part ${idx + 1} (${formatSeconds(chunks[idx].startSeconds)} - ${formatSeconds(chunks[idx].endSeconds)})\n\n${cleaned}`
+        : cleaned;
+    })
     .join('\n\n');
 
   // 3. Summarize full transcript
@@ -120,6 +124,7 @@ export async function processAudioFile(
     summaryMarkdown,
     fullTranscript,
     modelName: config.geminiModel,
+    transcribeModelName: config.geminiTranscribeModel,
   });
 
   logInfo(`Saved Markdown note: ${markdownPath}`);
