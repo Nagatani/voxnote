@@ -39,6 +39,37 @@ export function formatSeconds(totalSeconds) {
 }
 
 /**
+ * Detect whether an audio file/chunk is effectively silent using ffmpeg volumedetect.
+ * Prevents unnecessary API calls and hallucinations on silent intervals.
+ */
+export async function isSilentAudio(
+  filePath,
+  maxVolumeThresholdDb = -45.0,
+  meanVolumeThresholdDb = -55.0
+) {
+  try {
+    const { stderr } = await execFileAsync('ffmpeg', [
+      '-i',
+      filePath,
+      '-af',
+      'volumedetect',
+      '-f',
+      'null',
+      '-',
+    ]);
+    const maxMatch = stderr.match(/max_volume:\s*([-\d.]+)\s*dB/);
+    const meanMatch = stderr.match(/mean_volume:\s*([-\d.]+)\s*dB/);
+    if (!maxMatch || !meanMatch) return false;
+
+    const maxVol = parseFloat(maxMatch[1]);
+    const meanVol = parseFloat(meanMatch[1]);
+    return maxVol <= maxVolumeThresholdDb && meanVol <= meanVolumeThresholdDb;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Split or normalize an audio file into manageable chunks for Gemini API transcription.
  * Includes chunk duration & overlap settings in the cache directory name so changing
  * `CHUNK_DURATION_SECONDS` never reuses mismatched audio chunks.

@@ -8,10 +8,14 @@ import test from 'node:test';
 import { promisify } from 'node:util';
 import {
   getAudioDurationSeconds,
+  isSilentAudio,
   prepareAudioChunks,
 } from '../src/audioChunker.js';
 import { loadConfig } from '../src/config.js';
-import { parseTitleAndSummary } from '../src/geminiService.js';
+import {
+  hasMeaningfulSpeech,
+  parseTitleAndSummary,
+} from '../src/geminiService.js';
 import {
   collapseConsecutivePlaceholders,
   extractRecordedDateFromFilename,
@@ -149,4 +153,52 @@ test('collapseConsecutivePlaceholders merges contiguous skip ranges and duplicat
       '[発話なし]',
     ].join('\n\n')
   );
+});
+
+test('hasMeaningfulSpeech detects whether transcript has real speech beyond placeholders', () => {
+  const onlyPlaceholders = [
+    '### Part 1 (00:00:00 - 00:10:00)',
+    '[発話なし]',
+    '### Part 2 (00:09:55 - 00:20:00)',
+    '[※ 00:09:55 〜 00:20:00 の区間は背景音またはAPI制限によりスキップされました]',
+  ].join('\n\n');
+  assert.equal(hasMeaningfulSpeech(onlyPlaceholders), false);
+  assert.equal(
+    hasMeaningfulSpeech(`${onlyPlaceholders}\n\n本日の議題です。`),
+    true
+  );
+});
+
+test('isSilentAudio distinguishes silent audio from tone audio', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'voxnote-silent-'));
+  const silentWav = path.join(tmpDir, 'silent.wav');
+  const toneWav = path.join(tmpDir, 'tone.wav');
+
+  await execFileAsync('ffmpeg', [
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    'anullsrc=r=16000:cl=mono',
+    '-t',
+    '2',
+    silentWav,
+  ]);
+  await execFileAsync('ffmpeg', [
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    'sine=frequency=440:duration=2',
+    '-ac',
+    '1',
+    '-ar',
+    '16000',
+    toneWav,
+  ]);
+
+  assert.equal(await isSilentAudio(silentWav), true);
+  assert.equal(await isSilentAudio(toneWav), false);
+
+  await fs.rm(tmpDir, { recursive: true, force: true });
 });

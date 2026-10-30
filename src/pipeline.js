@@ -74,6 +74,11 @@ export async function processAudioFile(
       continue;
     }
 
+    const prevText =
+      chunkTranscripts.length > 0
+        ? chunkTranscripts[chunkTranscripts.length - 1].slice(-250).trim()
+        : '';
+
     logInfo(
       `Transcribing chunk #${chunk.index + 1}/${chunks.length} [${formatSeconds(
         chunk.startSeconds
@@ -84,7 +89,7 @@ export async function processAudioFile(
       chunks.length,
       transcribePrompt,
       config,
-      { dryRun }
+      { dryRun, previousContext: prevText }
     );
 
     await fs.writeFile(chunk.transcriptCachePath, chunkText, 'utf8');
@@ -129,7 +134,21 @@ export async function processAudioFile(
 
   logInfo(`Saved Markdown note: ${markdownPath}`);
 
-  // 5. Record in history & clean up temporary chunk directory
+  // 5. Record in history, remove superseded Markdown if re-run, & clean up temporary chunk directory
+  const prevRecord = historyStore.getRecord(fileHash);
+  if (
+    prevRecord?.markdownPath &&
+    prevRecord.markdownPath !== markdownPath &&
+    fsSync.existsSync(prevRecord.markdownPath)
+  ) {
+    try {
+      await fs.unlink(prevRecord.markdownPath);
+      logInfo(`Removed superseded Markdown note: ${prevRecord.markdownPath}`);
+    } catch {
+      // Ignore unlink error
+    }
+  }
+
   if (!dryRun) {
     historyStore.markProcessed(fileHash, {
       fileName,

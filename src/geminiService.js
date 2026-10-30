@@ -3,12 +3,18 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { formatSeconds, getAudioDurationSeconds } from './audioChunker.js';
+import {
+  formatSeconds,
+  getAudioDurationSeconds,
+  isSilentAudio,
+} from './audioChunker.js';
 import { logInfo, logWarn } from './notifier.js';
 
 const execFileAsync = promisify(execFile);
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com';
+const REQUEST_TIMEOUT_MS = 240_000; // 4 minutes per API request
+const HEARTBEAT_INTERVAL_MS = 25_000; // Log progress every 25 seconds during long calls
 
 const MIME_MAP = {
   '.wav': 'audio/wav',
@@ -52,10 +58,38 @@ async function sleep(ms) {
 }
 
 /**
+ * Run an async operation while printing a periodic heartbeat log so the user knows
+ * the process is actively waiting on Gemini API and not frozen.
+ */
+async function withProgressHeartbeat(label, fn) {
+  const startTime = Date.now();
+  const timer = setInterval(() => {
+    const elapsedSec = Math.round((Date.now() - startTime) / 1000);
+    logInfo(`  ... waiting for Gemini API response (${label}, ${elapsedSec}s elapsed)`);
+  }, HEARTBEAT_INTERVAL_MS);
+
+  if (typeof timer.unref === 'function') {
+    timer.unref();
+  }
+
+  try {
+    return await fn();
+  } finally {
+    clearInterval(timer);
+  }
+}
+
+/**
  * Call Gemini REST API (`generateContent`) with automatic exponential backoff retry for 429 / 5xx.
  * Treats empty text with `finishReason: "STOP"` as `[発話なし]` without retrying.
  */
-async function callGenerateContent(apiKey, model, contents, maxRetries = 3) {
+async function callGenerateContent(
+  apiKey,
+  model,
+  contents,
+  maxRetries = 3,
+  label = 'generateContent'
+) {
   const url = `${GEMINI_API_BASE}/v1beta/models/${encodeURIComponent(
     model
   )}:generateContent?key=${encodeURIComponent(apiKey)}`;
@@ -63,17 +97,20 @@ async function callGenerateContent(apiKey, model, contents, maxRetries = 3) {
   let lastError;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents,
-          safetySettings: DEFAULT_SAFETY_SETTINGS,
-          generationConfig: {
-            temperature: 0.2,
-          },
-        }),
-      });
+      const response = await withProgressHeartbeat(label, () =>
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          body: JSON.stringify({
+            contents,
+            safetySettings: DEFAULT_SAFETY_SETTINGS,
+            generationConfig: {
+              temperature: 0.2,
+            },
+          }),
+        })
+      );
 
       if (!response.ok) {
         const errBody = await response.text();
@@ -161,6 +198,7 @@ async function uploadToGeminiFileApi(apiKey, filePath, mimeType) {
   )}`;
   const startRes = await fetch(startUrl, {
     method: 'POST',
+    signal: AbortSignal.timeout(60_000),
     headers: {
       'X-Goog-Upload-Protocol': 'resumable',
       'X-Goog-Upload-Command': 'start',
@@ -182,15 +220,20 @@ async function uploadToGeminiFileApi(apiKey, filePath, mimeType) {
     throw new Error('Missing x-goog-upload-url header from Gemini File API');
   }
 
-  const uploadRes = await fetch(uploadUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Length': String(numBytes),
-      'X-Goog-Upload-Offset': '0',
-      'X-Goog-Upload-Command': 'upload, finalize',
-    },
-    body: fileBuffer,
-  });
+  const uploadRes = await withProgressHeartbeat(
+    `upload ${displayName}`,
+    () =>
+      fetch(uploadUrl, {
+        method: 'POST',
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        headers: {
+          'Content-Length': String(numBytes),
+          'X-Goog-Upload-Offset': '0',
+          'X-Goog-Upload-Command': 'upload, finalize',
+        },
+        body: fileBuffer,
+      })
+  );
 
   if (!uploadRes.ok) {
     throw new Error(
@@ -203,7 +246,8 @@ async function uploadToGeminiFileApi(apiKey, filePath, mimeType) {
   // Poll until ACTIVE
   for (let i = 0; i < 30; i++) {
     const checkRes = await fetch(
-      `${GEMINI_API_BASE}/v1beta/${file.name}?key=${encodeURIComponent(apiKey)}`
+      `${GEMINI_API_BASE}/v1beta/${file.name}?key=${encodeURIComponent(apiKey)}`,
+      { signal: AbortSignal.timeout(30_000) }
     );
     if (checkRes.ok) {
       const current = await checkRes.json();
@@ -224,7 +268,7 @@ async function deleteGeminiRemoteFile(apiKey, fileName) {
   try {
     await fetch(
       `${GEMINI_API_BASE}/v1beta/${fileName}?key=${encodeURIComponent(apiKey)}`,
-      { method: 'DELETE' }
+      { method: 'DELETE', signal: AbortSignal.timeout(15_000) }
     );
   } catch {
     // Best-effort remote file cleanup
@@ -262,27 +306,32 @@ async function transcribeWithDedicatedModel(audioPath, config) {
       );
     }
 
-    const res = await fetch(`${GEMINI_API_BASE}/v1beta/interactions`, {
-      method: 'POST',
-      headers: {
-        'x-goog-api-key': config.geminiApiKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: modelName,
-        store: false,
-        input: [
-          {
-            type: 'file',
-            file_uri: uploadedFile.uri,
-            mime_type: uploadedFile.mimeType || mimeType,
+    const res = await withProgressHeartbeat(
+      config.geminiTranscribeModel,
+      () =>
+        fetch(`${GEMINI_API_BASE}/v1beta/interactions`, {
+          method: 'POST',
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          headers: {
+            'x-goog-api-key': config.geminiApiKey,
+            'Content-Type': 'application/json',
           },
-        ],
-        generation_config: {
-          transcription_config: transcriptionConfig,
-        },
-      }),
-    });
+          body: JSON.stringify({
+            model: modelName,
+            store: false,
+            input: [
+              {
+                type: 'file',
+                file_uri: uploadedFile.uri,
+                mime_type: uploadedFile.mimeType || mimeType,
+              },
+            ],
+            generation_config: {
+              transcription_config: transcriptionConfig,
+            },
+          }),
+        })
+    );
 
     if (!res.ok) {
       const errBody = await res.text();
@@ -319,7 +368,12 @@ async function transcribeWithDedicatedModel(audioPath, config) {
 /**
  * Send a single audio file + prompt to Gemini `generateContent` (using inlineData for <=15MB or File API for >15MB).
  */
-async function sendAudioToGenerateContent(audioPath, promptText, config) {
+async function sendAudioToGenerateContent(
+  audioPath,
+  promptText,
+  config,
+  label = 'transcribe'
+) {
   // For generateContent, audio/mp4 is widely accepted for .m4a
   const ext = path.extname(audioPath).toLowerCase();
   const mimeType = ext === '.m4a' ? 'audio/mp4' : getAudioMimeType(audioPath);
@@ -328,20 +382,26 @@ async function sendAudioToGenerateContent(audioPath, promptText, config) {
   if (stat.size <= 15 * 1024 * 1024) {
     const buffer = await fs.readFile(audioPath);
     const base64Audio = buffer.toString('base64');
-    return callGenerateContent(config.geminiApiKey, config.geminiModel, [
-      {
-        role: 'user',
-        parts: [
-          { text: promptText },
-          {
-            inlineData: {
-              mimeType,
-              data: base64Audio,
+    return callGenerateContent(
+      config.geminiApiKey,
+      config.geminiModel,
+      [
+        {
+          role: 'user',
+          parts: [
+            { text: promptText },
+            {
+              inlineData: {
+                mimeType,
+                data: base64Audio,
+              },
             },
-          },
-        ],
-      },
-    ]);
+          ],
+        },
+      ],
+      3,
+      label
+    );
   }
 
   logInfo(`Uploading ${path.basename(audioPath)} via Gemini File API...`);
@@ -351,20 +411,26 @@ async function sendAudioToGenerateContent(audioPath, promptText, config) {
     mimeType
   );
   try {
-    return await callGenerateContent(config.geminiApiKey, config.geminiModel, [
-      {
-        role: 'user',
-        parts: [
-          { text: promptText },
-          {
-            fileData: {
-              mimeType: uploadedFile.mimeType || mimeType,
-              fileUri: uploadedFile.uri,
+    return await callGenerateContent(
+      config.geminiApiKey,
+      config.geminiModel,
+      [
+        {
+          role: 'user',
+          parts: [
+            { text: promptText },
+            {
+              fileData: {
+                mimeType: uploadedFile.mimeType || mimeType,
+                fileUri: uploadedFile.uri,
+              },
             },
-          },
-        ],
-      },
-    ]);
+          ],
+        },
+      ],
+      3,
+      label
+    );
   } finally {
     await deleteGeminiRemoteFile(config.geminiApiKey, uploadedFile.name);
   }
@@ -437,6 +503,18 @@ async function transcribeBlockedChunkBySplitting(chunk, fallbackPrompt, config) 
       ]);
     }
 
+    if (await isSilentAudio(subAudioPath)) {
+      logInfo(
+        `  Sub-chunk #${subIndex + 1} [${formatSeconds(absStart)} - ${formatSeconds(
+          absEnd
+        )}] is silent; skipping API call.`
+      );
+      await fs.writeFile(subCachePath, '[発話なし]', 'utf8');
+      subResults.push('[発話なし]');
+      subIndex++;
+      continue;
+    }
+
     logInfo(
       `  Transcribing sub-chunk #${subIndex + 1} [${formatSeconds(
         absStart
@@ -447,7 +525,8 @@ async function transcribeBlockedChunkBySplitting(chunk, fallbackPrompt, config) 
       const subText = await sendAudioToGenerateContent(
         subAudioPath,
         `${fallbackPrompt}\n（対象区間: ${formatSeconds(absStart)}〜${formatSeconds(absEnd)}）`,
-        config
+        config,
+        `sub-chunk #${subIndex + 1}`
       );
       await fs.writeFile(subCachePath, subText, 'utf8');
       subResults.push(subText);
@@ -476,9 +555,10 @@ async function transcribeBlockedChunkBySplitting(chunk, fallbackPrompt, config) 
 
 /**
  * Transcribe a single audio chunk:
- * 1. If `config.geminiTranscribeModel` is a dedicated `*transcribe*` model (e.g. `gemini-3.5-transcribe`),
+ * 1. Pre-checks for complete silence via `isSilentAudio`.
+ * 2. If `config.geminiTranscribeModel` is a dedicated `*transcribe*` model (e.g. `gemini-3.5-transcribe`),
  *    uses the dedicated Speech-to-Text Interactions API first.
- * 2. Falls back to `config.geminiModel` (`generateContent`) and 90-second sub-chunk splitting if needed.
+ * 3. Falls back to `config.geminiModel` (`generateContent`) with previous-chunk context and 90s sub-chunk splitting.
  */
 export async function transcribeAudioChunk(
   chunk,
@@ -487,7 +567,7 @@ export async function transcribeAudioChunk(
   config,
   options = {}
 ) {
-  const { dryRun = false } = options;
+  const { dryRun = false, previousContext = '' } = options;
 
   if (dryRun) {
     return `[${formatSeconds(chunk.startSeconds)}] (Dry-run) チャンク #${
@@ -501,6 +581,15 @@ export async function transcribeAudioChunk(
     throw new Error(
       'GEMINI_API_KEY is not set. Please configure it in .env or environment variables.'
     );
+  }
+
+  if (await isSilentAudio(chunk.audioPath)) {
+    logInfo(
+      `Chunk #${chunk.index + 1}/${totalChunks} [${formatSeconds(
+        chunk.startSeconds
+      )} - ${formatSeconds(chunk.endSeconds)}] is silent; skipping API call.`
+    );
+    return '[発話なし]';
   }
 
   const transcribeModel = config.geminiTranscribeModel || '';
@@ -530,10 +619,19 @@ export async function transcribeAudioChunk(
       ? `\n\n【用語ヒント（音声に含まれる可能性がある固有名詞・専門用語）】\n${config.customVocabulary.join(', ')}`
       : '';
 
-  const fullPrompt = `${promptTemplate.trim()}${vocabHint}${chunkHeader}`;
+  const contextHint = previousContext
+    ? `\n\n【直前パートの末尾（文脈・話者表記統一の参考用。この内容は重複して出力しないでください）】\n${previousContext}`
+    : '';
+
+  const fullPrompt = `${promptTemplate.trim()}${vocabHint}${chunkHeader}${contextHint}`;
 
   try {
-    return await sendAudioToGenerateContent(chunk.audioPath, fullPrompt, config);
+    return await sendAudioToGenerateContent(
+      chunk.audioPath,
+      fullPrompt,
+      config,
+      `chunk #${chunk.index + 1}/${totalChunks}`
+    );
   } catch (err) {
     if (!(err instanceof GeminiBlockedError)) {
       throw err;
@@ -548,13 +646,25 @@ export async function transcribeAudioChunk(
       .filter(Boolean)
       .join('\n');
 
-    // Immediately split into 90s sub-chunks without wasting 40s retrying the full 10-min chunk
     return await transcribeBlockedChunkBySplitting(
       chunk,
       fallbackPrompt,
       config
     );
   }
+}
+
+/**
+ * Check whether the full transcript contains any actual spoken content
+ * beyond `[発話なし]`, skip notices, and `### Part ...` headers.
+ */
+export function hasMeaningfulSpeech(transcriptText) {
+  const stripped = String(transcriptText || '')
+    .replace(/^###\s+Part\s+\d+.*$/gm, '')
+    .replace(/\[発話なし\]/g, '')
+    .replace(/\[※[^\]]*スキップされました\]/g, '')
+    .trim();
+  return stripped.length > 0;
 }
 
 /**
@@ -584,6 +694,22 @@ export async function summarizeTranscript(
     };
   }
 
+  if (!hasMeaningfulSpeech(transcriptText)) {
+    return {
+      title: '発話なし（無音または背景音のみ）',
+      summaryMarkdown: [
+        '## 要約',
+        '- 録音データ内に認識可能な発話が含まれていませんでした。',
+        '',
+        '## 詳細・主なトピック',
+        '- 該当なし',
+        '',
+        '## アクションアイテム / TODO',
+        '- 特になし',
+      ].join('\n'),
+    };
+  }
+
   const prompt = `${summaryPromptTemplate.trim()}\n\n---\n【文字起こしテキスト】\n${transcriptText}`;
   const rawOutput = await callGenerateContent(
     config.geminiApiKey,
@@ -593,7 +719,9 @@ export async function summarizeTranscript(
         role: 'user',
         parts: [{ text: prompt }],
       },
-    ]
+    ],
+    3,
+    'summarize'
   );
 
   return parseTitleAndSummary(rawOutput);
