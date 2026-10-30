@@ -1,7 +1,12 @@
+import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import path from 'node:path';
-import { formatSeconds } from './audioChunker.js';
+import { promisify } from 'node:util';
+import { formatSeconds, getAudioDurationSeconds } from './audioChunker.js';
 import { logInfo, logWarn } from './notifier.js';
+
+const execFileAsync = promisify(execFile);
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com';
 
@@ -13,7 +18,29 @@ const MIME_MAP = {
   '.aac': 'audio/aac',
   '.flac': 'audio/flac',
   '.ogg': 'audio/ogg',
+  '.wma': 'audio/x-ms-wma',
+  '.webm': 'audio/webm',
 };
+
+const DEFAULT_SAFETY_SETTINGS = [
+  { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+  { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' },
+];
+
+export class GeminiBlockedError extends Error {
+  constructor(reason, rawResponse) {
+    super(
+      `Gemini API blocked content (reason: ${reason}). Raw response: ${JSON.stringify(
+        rawResponse
+      ).slice(0, 300)}`
+    );
+    this.name = 'GeminiBlockedError';
+    this.reason = reason;
+  }
+}
 
 export function getAudioMimeType(filePath) {
   const ext = path.extname(filePath).toLowerCase();
@@ -25,7 +52,9 @@ async function sleep(ms) {
 }
 
 /**
- * Call Gemini REST API with automatic exponential backoff retry for 429 / 5xx errors.
+ * Call Gemini REST API with automatic exponential backoff retry for 429 / 5xx / network errors.
+ * Throws `GeminiBlockedError` immediately (without pointless retries on cached blocks)
+ * when `promptFeedback.blockReason` or `finishReason` blocks the response.
  */
 async function callGenerateContent(apiKey, model, contents, maxRetries = 3) {
   const url = `${GEMINI_API_BASE}/v1beta/models/${encodeURIComponent(
@@ -40,6 +69,7 @@ async function callGenerateContent(apiKey, model, contents, maxRetries = 3) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents,
+          safetySettings: DEFAULT_SAFETY_SETTINGS,
           generationConfig: {
             temperature: 0.2,
           },
@@ -59,18 +89,35 @@ async function callGenerateContent(apiKey, model, contents, maxRetries = 3) {
           await sleep(waitMs);
           continue;
         }
-        throw new Error(
+        const httpErr = new Error(
           `Gemini API error (${response.status}): ${errBody.slice(0, 500)}`
         );
+        httpErr.nonRetryable = response.status >= 400 && response.status < 500 && response.status !== 429;
+        throw httpErr;
       }
 
       const data = await response.json();
+
+      // Check if blocked by promptFeedback or candidate finishReason
+      const blockReason =
+        data.promptFeedback?.blockReason ||
+        (data.candidates?.[0]?.finishReason &&
+        ['SAFETY', 'RECITATION', 'OTHER', 'BLOCKLIST', 'PROHIBITED_CONTENT'].includes(
+          data.candidates[0].finishReason
+        )
+          ? data.candidates[0].finishReason
+          : null);
+
       const text = (data.candidates?.[0]?.content?.parts || [])
+        .filter((p) => !p.thought)
         .map((p) => p.text || '')
         .join('')
         .trim();
 
       if (!text) {
+        if (blockReason) {
+          throw new GeminiBlockedError(blockReason, data);
+        }
         throw new Error(
           `Gemini API returned empty text. Raw response: ${JSON.stringify(data).slice(0, 300)}`
         );
@@ -78,8 +125,15 @@ async function callGenerateContent(apiKey, model, contents, maxRetries = 3) {
       return text;
     } catch (err) {
       lastError = err;
+      // Do not retry identical payload if blocked by safety/recitation/other or 4xx client error
+      if (err instanceof GeminiBlockedError || err.nonRetryable) {
+        throw err;
+      }
       if (attempt < maxRetries) {
         const waitMs = Math.pow(2, attempt) * 1500;
+        logWarn(
+          `Request attempt ${attempt}/${maxRetries} failed (${err.message}). Retrying in ${waitMs}ms...`
+        );
         await sleep(waitMs);
       }
     }
@@ -172,7 +226,165 @@ async function deleteGeminiRemoteFile(apiKey, fileName) {
 }
 
 /**
- * Transcribe a single audio chunk using Gemini.
+ * Send a single audio file + prompt to Gemini (using inlineData for <=15MB or File API for >15MB).
+ */
+async function sendAudioToGemini(audioPath, promptText, config) {
+  const mimeType = getAudioMimeType(audioPath);
+  const stat = await fs.stat(audioPath);
+
+  if (stat.size <= 15 * 1024 * 1024) {
+    const buffer = await fs.readFile(audioPath);
+    const base64Audio = buffer.toString('base64');
+    return callGenerateContent(config.geminiApiKey, config.geminiModel, [
+      {
+        role: 'user',
+        parts: [
+          { text: promptText },
+          {
+            inlineData: {
+              mimeType,
+              data: base64Audio,
+            },
+          },
+        ],
+      },
+    ]);
+  }
+
+  logInfo(`Uploading ${path.basename(audioPath)} via Gemini File API...`);
+  const uploadedFile = await uploadToGeminiFileApi(
+    config.geminiApiKey,
+    audioPath,
+    mimeType
+  );
+  try {
+    return await callGenerateContent(config.geminiApiKey, config.geminiModel, [
+      {
+        role: 'user',
+        parts: [
+          { text: promptText },
+          {
+            fileData: {
+              mimeType: uploadedFile.mimeType || mimeType,
+              fileUri: uploadedFile.uri,
+            },
+          },
+        ],
+      },
+    ]);
+  } finally {
+    await deleteGeminiRemoteFile(config.geminiApiKey, uploadedFile.name);
+  }
+}
+
+/**
+ * Fallback when a long audio chunk is blocked by `blockReason: OTHER` or `RECITATION`:
+ * Splits the chunk into smaller 3-minute (180s) sub-chunks so that a brief noisy/BGM segment
+ * does not cause the entire 20-minute chunk to fail.
+ */
+async function transcribeBlockedChunkBySplitting(chunk, fallbackPrompt, config) {
+  const SUB_CHUNK_SECONDS = 180; // 3 minutes per sub-chunk
+  const duration = await getAudioDurationSeconds(chunk.audioPath);
+  const workDir = path.dirname(chunk.audioPath);
+  const baseName = path.basename(chunk.audioPath, path.extname(chunk.audioPath));
+
+  if (duration <= SUB_CHUNK_SECONDS + 15) {
+    // Already short and still blocked -> skip only this segment instead of aborting the whole file
+    logWarn(
+      `Segment [${formatSeconds(chunk.startSeconds)} - ${formatSeconds(
+        chunk.endSeconds
+      )}] was blocked by Gemini API even after fallback; skipping segment.`
+    );
+    return `[※ ${formatSeconds(chunk.startSeconds)} 〜 ${formatSeconds(
+      chunk.endSeconds
+    )} の区間は背景音またはAPIのコンテンツ制限（blockReason: OTHER）により文字起こしをスキップしました]`;
+  }
+
+  logInfo(
+    `Splitting blocked chunk [${formatSeconds(chunk.startSeconds)} - ${formatSeconds(
+      chunk.endSeconds
+    )}] into ${SUB_CHUNK_SECONDS}s sub-chunks for recovery...`
+  );
+
+  const subResults = [];
+  let subIndex = 0;
+
+  for (let offset = 0; offset < duration; offset += SUB_CHUNK_SECONDS) {
+    const subLen = Math.min(SUB_CHUNK_SECONDS, duration - offset);
+    const absStart = chunk.startSeconds + offset;
+    const absEnd = absStart + subLen;
+    const subTag = `${baseName}_sub${String(subIndex).padStart(2, '0')}`;
+    const subAudioPath = path.join(workDir, `${subTag}.m4a`);
+    const subCachePath = path.join(workDir, `${subTag}.txt`);
+
+    if (fsSync.existsSync(subCachePath)) {
+      const cached = await fs.readFile(subCachePath, 'utf8');
+      subResults.push(cached);
+      subIndex++;
+      continue;
+    }
+
+    if (!fsSync.existsSync(subAudioPath)) {
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-ss',
+        String(offset),
+        '-t',
+        String(subLen),
+        '-i',
+        chunk.audioPath,
+        '-ac',
+        '1',
+        '-ar',
+        '16000',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '64k',
+        subAudioPath,
+      ]);
+    }
+
+    logInfo(
+      `  Transcribing sub-chunk #${subIndex + 1} [${formatSeconds(
+        absStart
+      )} - ${formatSeconds(absEnd)}]...`
+    );
+
+    try {
+      const subText = await sendAudioToGemini(
+        subAudioPath,
+        `${fallbackPrompt}\n（対象区間: ${formatSeconds(absStart)}〜${formatSeconds(absEnd)}）`,
+        config
+      );
+      await fs.writeFile(subCachePath, subText, 'utf8');
+      subResults.push(subText);
+    } catch (subErr) {
+      if (subErr instanceof GeminiBlockedError) {
+        logWarn(
+          `  Sub-chunk #${subIndex + 1} [${formatSeconds(absStart)} - ${formatSeconds(
+            absEnd
+          )}] blocked (${subErr.reason}); skipping this 3-min segment.`
+        );
+        const placeholder = `[※ ${formatSeconds(absStart)} 〜 ${formatSeconds(
+          absEnd
+        )} の区間は背景音またはAPI制限によりスキップされました]`;
+        await fs.writeFile(subCachePath, placeholder, 'utf8');
+        subResults.push(placeholder);
+      } else {
+        throw subErr;
+      }
+    }
+
+    subIndex++;
+  }
+
+  return subResults.join('\n\n');
+}
+
+/**
+ * Transcribe a single audio chunk using Gemini, with automatic fallback and sub-chunk
+ * recovery if Gemini returns `blockReason: OTHER` / `RECITATION`.
  */
 export async function transcribeAudioChunk(
   chunk,
@@ -197,8 +409,6 @@ export async function transcribeAudioChunk(
     );
   }
 
-  const mimeType = getAudioMimeType(chunk.audioPath);
-  const stat = await fs.stat(chunk.audioPath);
   const chunkHeader =
     totalChunks > 1
       ? `\n\n※この音声は全体のうちパート ${chunk.index + 1}/${totalChunks}（開始位置: ${formatSeconds(
@@ -208,49 +418,45 @@ export async function transcribeAudioChunk(
 
   const fullPrompt = `${promptTemplate.trim()}${chunkHeader}`;
 
-  // Use inline base64 for files <= 15 MB, otherwise use Gemini File API
-  if (stat.size <= 15 * 1024 * 1024) {
-    const buffer = await fs.readFile(chunk.audioPath);
-    const base64Audio = buffer.toString('base64');
-    return callGenerateContent(config.geminiApiKey, config.geminiModel, [
-      {
-        role: 'user',
-        parts: [
-          { text: fullPrompt },
-          {
-            inlineData: {
-              mimeType,
-              data: base64Audio,
-            },
-          },
-        ],
-      },
-    ]);
-  }
-
-  logInfo(`Uploading chunk #${chunk.index + 1} via Gemini File API...`);
-  const uploadedFile = await uploadToGeminiFileApi(
-    config.geminiApiKey,
-    chunk.audioPath,
-    mimeType
-  );
   try {
-    return await callGenerateContent(config.geminiApiKey, config.geminiModel, [
-      {
-        role: 'user',
-        parts: [
-          { text: fullPrompt },
-          {
-            fileData: {
-              mimeType: uploadedFile.mimeType || mimeType,
-              fileUri: uploadedFile.uri,
-            },
-          },
-        ],
-      },
-    ]);
-  } finally {
-    await deleteGeminiRemoteFile(config.geminiApiKey, uploadedFile.name);
+    return await sendAudioToGemini(chunk.audioPath, fullPrompt, config);
+  } catch (err) {
+    if (!(err instanceof GeminiBlockedError)) {
+      throw err;
+    }
+
+    logWarn(
+      `Chunk #${chunk.index + 1} [${formatSeconds(
+        chunk.startSeconds
+      )} - ${formatSeconds(
+        chunk.endSeconds
+      )}] was blocked (${err.reason}). Retrying with simplified prompt...`
+    );
+
+    const fallbackPrompt = [
+      'この音声に含まれる人の会話・発言内容のみを日本語で文字起こししてください。',
+      '背景の音楽・BGM・環境音・雑音はすべて無視し、聞き取れる会話のみを自然な文章で出力してください。',
+      '前置きや挨拶は出力せず、本文のみを出力してください。',
+    ].join('\n');
+
+    try {
+      return await sendAudioToGemini(
+        chunk.audioPath,
+        `${fallbackPrompt}\n（区間: ${formatSeconds(chunk.startSeconds)}〜${formatSeconds(
+          chunk.endSeconds
+        )}）`,
+        config
+      );
+    } catch (fallbackErr) {
+      if (!(fallbackErr instanceof GeminiBlockedError)) {
+        throw fallbackErr;
+      }
+      return await transcribeBlockedChunkBySplitting(
+        chunk,
+        fallbackPrompt,
+        config
+      );
+    }
   }
 }
 

@@ -74,7 +74,7 @@ export function loadConfig(customConfigPath = null, overrides = {}) {
 
   return {
     geminiApiKey: apiKey,
-    geminiModel: get('GEMINI_MODEL', 'gemini-2.5-flash'),
+    geminiModel: get('GEMINI_MODEL', 'gemini-3.8-flash'),
     recorderSourceDir: resolveDir(get('RECORDER_SOURCE_DIR', './input_recorder')),
     audioArchiveDir: resolveDir(get('AUDIO_ARCHIVE_DIR', './audio_archive')),
     markdownOutputDir: resolveDir(get('MARKDOWN_OUTPUT_DIR', './output_notes')),
